@@ -31,6 +31,20 @@ import {
 const WEBCAM_FPS = 8; // Stable, smooth FPS that won't overload websockets
 const WS_RECONNECT_INTERVAL = 3000;
 
+// Inline worker to force background timer execution without browser throttling (1000ms clamp)
+const timerWorkerBlob = new Blob([`
+  let timerId = null;
+  self.onmessage = function(e) {
+    if (e.data.action === 'start') {
+      if (timerId) clearInterval(timerId);
+      timerId = setInterval(() => self.postMessage('tick'), e.data.ms);
+    } else if (e.data.action === 'stop') {
+      clearInterval(timerId);
+      timerId = null;
+    }
+  }
+`], { type: 'application/javascript' });
+
 export default function App() {
   // Navigation tabs: 'overlay' | 'host' | 'player'
   const [activeTab, setActiveTab] = useState<'overlay' | 'host' | 'player'>('overlay');
@@ -71,8 +85,19 @@ export default function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const cameraWorkerRef = useRef<Worker | null>(null);
+  const mockWorkerRef = useRef<Worker | null>(null);
   const captureIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const webcamFramesRef = useRef<Record<number, string>>({});
+  
+  // Reconnection refs
+  const currentSlotIdRef = useRef(currentPlayerSlotId);
+  const currentNicknameRef = useRef(playerNickname);
+
+  useEffect(() => {
+    currentSlotIdRef.current = currentPlayerSlotId;
+    currentNicknameRef.current = playerNickname;
+  }, [currentPlayerSlotId, playerNickname]);
 
   // Save volume preference to localStorage
   useEffect(() => {
@@ -94,6 +119,15 @@ export default function App() {
       ws.onopen = () => {
         console.log('WebSocket successfully connected!');
         setWsConnected(true);
+        
+        // Auto-rejoin if reconnected
+        if (currentSlotIdRef.current) {
+          ws.send(JSON.stringify({
+            type: 'join',
+            slotId: currentSlotIdRef.current,
+            name: currentNicknameRef.current || 'Возврат'
+          }));
+        }
       };
 
       ws.onmessage = (event) => {
@@ -219,7 +253,11 @@ export default function App() {
         };
 
         // Setup ticked canvas snapshot
-        captureIntervalRef.current = setInterval(() => {
+        if (!cameraWorkerRef.current) {
+          cameraWorkerRef.current = new Worker(URL.createObjectURL(timerWorkerBlob));
+        }
+
+        cameraWorkerRef.current.onmessage = () => {
           // Do not pause on visibilityState so OBS/Twitch captures continue without lag when streamer minimizes
           if (vid && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
             // CRITICAL: Drop frames if the connection is struggling to keep up to eliminate 1-second delay lag
@@ -238,6 +276,21 @@ export default function App() {
               // Compress to jpeg
               const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.25);
               
+              // IMMEDIATELY update local ref so the Overlay tab can see our own camera without waiting for server response
+              if (currentPlayerSlotId) {
+                webcamFramesRef.current[currentPlayerSlotId] = jpegDataUrl;
+                // Direct DOM update for local viewing
+                const imgEl = document.getElementById(`cam-feed-${currentPlayerSlotId}`) as HTMLImageElement;
+                if (imgEl) {
+                  imgEl.src = jpegDataUrl;
+                  imgEl.style.display = 'block';
+                }
+                const fallbackEl = document.getElementById(`cam-fallback-${currentPlayerSlotId}`);
+                if (fallbackEl) {
+                  fallbackEl.style.display = 'none';
+                }
+              }
+
               // Send off
               wsRef.current.send(JSON.stringify({
                 type: 'webcam',
@@ -246,7 +299,9 @@ export default function App() {
               }));
             }
           }
-        }, 1000 / WEBCAM_FPS);
+        };
+
+        cameraWorkerRef.current.postMessage({ action: 'start', ms: 1000 / WEBCAM_FPS });
       })
       .catch((err) => {
         console.error('Error starting camera stream:', err);
@@ -255,9 +310,8 @@ export default function App() {
       });
     } else {
       // Clean up camera slots when explicitly turned off
-      if (captureIntervalRef.current) {
-        clearInterval(captureIntervalRef.current);
-        captureIntervalRef.current = null;
+      if (cameraWorkerRef.current) {
+        cameraWorkerRef.current.postMessage({ action: 'stop' });
       }
       if (localStream) {
         localStream.getTracks().forEach(track => track.stop());
@@ -267,9 +321,8 @@ export default function App() {
 
     return () => {
       // Don't kill tracks on tab change unmount, wait for explicit deactivate
-      if (captureIntervalRef.current) {
-        clearInterval(captureIntervalRef.current);
-        captureIntervalRef.current = null;
+      if (cameraWorkerRef.current) {
+        cameraWorkerRef.current.postMessage({ action: 'stop' });
       }
       // If we are unmounting completely we can stop the track, but useEffect re-runs shouldn't kill it unless we want to
       // Wait, to keep track stable we ONLY stop the track on explicit isWebcamActive change which is handled by the else block.
@@ -278,10 +331,12 @@ export default function App() {
 
   // Demo Camera Generator Loop (for easier offline twitch layout testing)
   useEffect(() => {
-    let mockInterval: NodeJS.Timeout | null = null;
-    
     if (mockCameraEnabled && currentPlayerSlotId) {
-      mockInterval = setInterval(() => {
+      if (!mockWorkerRef.current) {
+        mockWorkerRef.current = new Worker(URL.createObjectURL(timerWorkerBlob));
+      }
+
+      mockWorkerRef.current.onmessage = () => {
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
           // Generate a thematic canvas graphics frame with randomized visual values & noise
           const canvas = document.createElement('canvas');
@@ -340,6 +395,22 @@ export default function App() {
 
             // Compress & stream
             const frameData = canvas.toDataURL('image/jpeg', 0.5);
+            
+            // Immediately update local webcam frames for overlay self-testing
+            if (currentPlayerSlotId) {
+              webcamFramesRef.current[currentPlayerSlotId] = frameData;
+              // Direct DOM update for local viewing
+              const imgEl = document.getElementById(`cam-feed-${currentPlayerSlotId}`) as HTMLImageElement;
+              if (imgEl) {
+                imgEl.src = frameData;
+                imgEl.style.display = 'block';
+              }
+              const fallbackEl = document.getElementById(`cam-fallback-${currentPlayerSlotId}`);
+              if (fallbackEl) {
+                fallbackEl.style.display = 'none';
+              }
+            }
+
             wsRef.current.send(JSON.stringify({
               type: 'webcam',
               slotId: currentPlayerSlotId,
@@ -347,17 +418,19 @@ export default function App() {
             }));
           }
         }
-      }, 300);
+      };
+      
+      mockWorkerRef.current.postMessage({ action: 'start', ms: 300 });
     } else {
-       if (mockInterval) {
-         clearInterval(mockInterval);
+       if (mockWorkerRef.current) {
+         mockWorkerRef.current.postMessage({ action: 'stop' });
        }
     }
 
     return () => {
       // Don't kill worker on unmount unless needed, though unmount does clean it up.
-      if (mockInterval) {
-        clearInterval(mockInterval);
+      if (mockWorkerRef.current) {
+        mockWorkerRef.current.postMessage({ action: 'stop' });
       }
     };
   }, [mockCameraEnabled, currentPlayerSlotId, activeTab]);
