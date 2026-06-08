@@ -28,7 +28,7 @@ import {
 } from './audio';
 
 // Constants
-const WEBCAM_FPS = 4; // Compact interval frame rate (approx 250ms) to conserve server bandwidth
+const WEBCAM_FPS = 3; // Ultra compact interval frame rate to eliminate server load and prevent webcam lag
 const WS_RECONNECT_INTERVAL = 3000;
 
 export default function App() {
@@ -51,6 +51,11 @@ export default function App() {
   });
 
   const [soundEnabled, setSoundEnabled] = useState(true);
+  const [volume, setVolume] = useState(() => {
+    const saved = localStorage.getItem('mafia_volume');
+    return saved !== null ? parseFloat(saved) : 0.5;
+  });
+  const [cleanMode, setCleanMode] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [currentPlayerSlotId, setCurrentPlayerSlotId] = useState<number | null>(null);
   const [playerNickname, setPlayerNickname] = useState('');
@@ -67,6 +72,12 @@ export default function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const captureIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const webcamFramesRef = useRef<Record<number, string>>({});
+
+  // Save volume preference to localStorage
+  useEffect(() => {
+    localStorage.setItem('mafia_volume', volume.toString());
+  }, [volume]);
 
   // 1. Establish real-time WebSocket connection
   useEffect(() => {
@@ -89,26 +100,53 @@ export default function App() {
         try {
           const data = JSON.parse(event.data);
 
-          if (data.type === 'init') {
+          if (data.type === 'init' || data.type === 'state_update') {
             setGameState(data.state);
-          } else if (data.type === 'state_update') {
-            setGameState(data.state);
-          } else if (data.type === 'webcam') {
-            // Update individual webcam frame quickly without replacing full state arrays
-            setGameState(prev => {
-              const updatedSlots = prev.slots.map(s => {
-                if (s.id === data.slotId) {
-                  return { ...s, webcamFrame: data.frame };
+            // Populate initial frames into references
+            data.state.slots.forEach((s: any) => {
+              if (s.webcamFrame) {
+                webcamFramesRef.current[s.id] = s.webcamFrame;
+                
+                // Directly sync existing DOM images to avoid flashing
+                const imgEl = document.getElementById(`cam-feed-${s.id}`) as HTMLImageElement;
+                if (imgEl) {
+                  imgEl.src = s.webcamFrame;
+                  imgEl.style.display = 'block';
                 }
-                return s;
-              });
-              return { ...prev, slots: updatedSlots };
+                const fallbackEl = document.getElementById(`cam-fallback-${s.id}`);
+                if (fallbackEl) {
+                  fallbackEl.style.display = 'none';
+                }
+              } else if (!s.alive) {
+                // If dead and has a death frame, display it
+                if (s.deathFrame) {
+                  const imgEl = document.getElementById(`cam-feed-${s.id}`) as HTMLImageElement;
+                  if (imgEl) {
+                    imgEl.src = s.deathFrame;
+                    imgEl.style.display = 'block';
+                  }
+                }
+              }
             });
+          } else if (data.type === 'webcam') {
+            // Save webcam frame into mutable reference to bypass React render completely (extreme speed boost)
+            webcamFramesRef.current[data.slotId] = data.frame;
+
+            // Direct DOM update instead of re-rendering whole React view 4 times/sec per user
+            const imgEl = document.getElementById(`cam-feed-${data.slotId}`) as HTMLImageElement;
+            if (imgEl) {
+              imgEl.src = data.frame;
+              imgEl.style.display = 'block';
+            }
+            const fallbackEl = document.getElementById(`cam-fallback-${data.slotId}`);
+            if (fallbackEl) {
+              fallbackEl.style.display = 'none';
+            }
           } else if (data.type === 'trigger_kill') {
             // Active full screen announcement
             setShowDeathOverlay(data.name);
             if (soundEnabled) {
-              playGunshotSound();
+              playGunshotSound(volume);
             }
             // Auto hide after 4 seconds
             setTimeout(() => {
@@ -138,27 +176,27 @@ export default function App() {
       if (wsRef.current) wsRef.current.close();
       clearTimeout(reconnectTimeout);
     };
-  }, [soundEnabled]);
+  }, [soundEnabled, volume]);
 
   // Sync Victory Sounds
   useEffect(() => {
     if (gameState.victory && soundEnabled) {
       if (gameState.victory === 'mafia') {
-        playMafiaVictorySound();
+        playMafiaVictorySound(volume);
       } else if (gameState.victory === 'civilians') {
-        playCiviliansVictorySound();
+        playCiviliansVictorySound(volume);
       }
     }
-  }, [gameState.victory, soundEnabled]);
+  }, [gameState.victory, soundEnabled, volume]);
 
   // 2. Local Desktop Webcame capture handler
   useEffect(() => {
     if (isWebcamActive && activeTab === 'player' && currentPlayerSlotId) {
-      // Initalize camera
+      // Initalize camera using ideal standard 16:9 aspect ratio
       navigator.mediaDevices.getUserMedia({ 
         video: { 
-          width: { ideal: 480 }, 
-          height: { ideal: 360 }, 
+          width: { ideal: 320 }, 
+          height: { ideal: 180 }, 
           frameRate: { ideal: WEBCAM_FPS } 
         }, 
         audio: false 
@@ -174,16 +212,19 @@ export default function App() {
 
         // Setup ticking canvas snapshot capturing to base64
         captureIntervalRef.current = setInterval(() => {
+          // Pause camera capture stream when tab is hidden or minimized to save huge device resources and prevent lags
+          if (document.visibilityState !== 'visible') return;
+
           if (videoRef.current && canvasRef.current && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
             const context = canvasRef.current.getContext('2d');
             if (context) {
-              // Ensure size
-              canvasRef.current.width = 320;
-              canvasRef.current.height = 240;
-              context.drawImage(videoRef.current, 0, 0, 320, 240);
+              // Ensure size is exactly 16:9 (240x135) to look absolutely perfect, crisp and natural
+              canvasRef.current.width = 240;
+              canvasRef.current.height = 135;
+              context.drawImage(videoRef.current, 0, 0, 240, 135);
               
-              // Compress to jpeg
-              const jpegDataUrl = canvasRef.current.toDataURL('image/jpeg', 0.5);
+              // Compress to jpeg with specialized quality 0.15 (approx 4-5 KB) to save 10x bandwidth
+              const jpegDataUrl = canvasRef.current.toDataURL('image/jpeg', 0.15);
               
               // Send off
               wsRef.current.send(JSON.stringify({
@@ -384,251 +425,321 @@ export default function App() {
   return (
     <div className="min-h-screen bg-wood-pattern text-stone-200 flex flex-col font-sans selection:bg-amber-950 selection:text-amber-200" id="mafia-app-root">
       
-      {/* 1. Header & Branding Panels */}
-      <header className="bg-stone-950/70 py-4 px-6 border-b border-stone-800 shadow-md backdrop-blur-sm z-30" id="header-bar">
-        <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
-          
-          {/* Logo / Title (Strictly matching "Мафия Тафида") */}
-          <div className="flex items-center gap-3" id="brand-panel">
-            <div className="bg-amber-500/10 p-2.5 rounded-lg border border-gold/40 flex items-center justify-center shadow-lg" id="stamp-logo">
-              <Skull className="w-8 h-8 text-gold animate-pulse" />
+      {/* 1. Header & Branding Panels (Hidden completely in clean mode to allow pristine OBS captures) */}
+      {!cleanMode && (
+        <header className="bg-stone-950/70 py-4 px-6 border-b border-stone-800 shadow-md backdrop-blur-sm z-30 animate-fadeIn" id="header-bar">
+          <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
+            
+            {/* Logo / Title (Strictly matching "Мафия Тафида") */}
+            <div className="flex items-center gap-3" id="brand-panel">
+              <div className="bg-amber-500/10 p-2.5 rounded-lg border border-gold/40 flex items-center justify-center shadow-lg" id="stamp-logo">
+                <Skull className="w-8 h-8 text-gold animate-pulse" />
+              </div>
+              <div>
+                <h1 className="text-3xl font-bold font-serif tracking-widest text-gold uppercase glow-text" id="brand-title">
+                  Мафия Тафида
+                </h1>
+                <p className="text-xs font-mono text-stone-400 tracking-wider">
+                  Twitch Stream Overlay & Host Deck
+                </p>
+              </div>
             </div>
-            <div>
-              <h1 className="text-3xl font-bold font-serif tracking-widest text-gold uppercase glow-text" id="brand-title">
-                Мафия Тафида
-              </h1>
-              <p className="text-xs font-mono text-stone-400 tracking-wider">
-                Twitch Stream Overlay & Host Deck
-              </p>
+
+            {/* Navigation Mode Selectors */}
+            <div className="flex bg-stone-900 border border-stone-800 p-1.5 rounded-xl gap-1 shadow-inner" id="view-tabs">
+              <button
+                id="tab-overlay"
+                onClick={() => setActiveTab('overlay')}
+                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                  activeTab === 'overlay' 
+                    ? 'bg-amber-900/60 text-gold border border-gold/30 shadow' 
+                    : 'text-stone-400 hover:text-stone-200 hover:bg-stone-800/40'
+                }`}
+              >
+                <Tv className="w-4 h-4" />
+                <span>Оверлей (Twitch/OBS)</span>
+              </button>
+              <button
+                id="tab-player"
+                onClick={() => setActiveTab('player')}
+                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                  activeTab === 'player' 
+                    ? 'bg-amber-900/60 text-gold border border-gold/30 shadow' 
+                    : 'text-stone-400 hover:text-stone-200 hover:bg-stone-800/40'
+                }`}
+              >
+                <Camera className="w-4 h-4" />
+                <span>Кабинет Участника</span>
+              </button>
+              <button
+                id="tab-host"
+                onClick={() => setActiveTab('host')}
+                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                  activeTab === 'host' 
+                    ? 'bg-amber-900/60 text-gold border border-gold/30 shadow' 
+                    : 'text-stone-400 hover:text-stone-200 hover:bg-stone-800/40'
+                }`}
+              >
+                <Crown className="w-4 h-4" />
+                <span>Пульт Ведущего</span>
+              </button>
             </div>
-          </div>
 
-          {/* Navigation Mode Selectors */}
-          <div className="flex bg-stone-900 border border-stone-800 p-1.5 rounded-xl gap-1 shadow-inner" id="view-tabs">
-            <button
-              id="tab-overlay"
-              onClick={() => setActiveTab('overlay')}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
-                activeTab === 'overlay' 
-                  ? 'bg-amber-900/60 text-gold border border-gold/30 shadow' 
-                  : 'text-stone-400 hover:text-stone-200 hover:bg-stone-800/40'
-              }`}
-            >
-              <Tv className="w-4 h-4" />
-              <span>Оверлей (Twitch/OBS)</span>
-            </button>
-            <button
-              id="tab-player"
-              onClick={() => setActiveTab('player')}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
-                activeTab === 'player' 
-                  ? 'bg-amber-900/60 text-gold border border-gold/30 shadow' 
-                  : 'text-stone-400 hover:text-stone-200 hover:bg-stone-800/40'
-              }`}
-            >
-              <Camera className="w-4 h-4" />
-              <span>Кабинет Участника</span>
-            </button>
-            <button
-              id="tab-host"
-              onClick={() => setActiveTab('host')}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
-                activeTab === 'host' 
-                  ? 'bg-amber-900/60 text-gold border border-gold/30 shadow' 
-                  : 'text-stone-400 hover:text-stone-200 hover:bg-stone-800/40'
-              }`}
-            >
-              <Crown className="w-4 h-4" />
-              <span>Пульт Ведущего</span>
-            </button>
-          </div>
+            {/* Status Panel (Sound & Network Check) */}
+            <div className="flex items-center gap-4" id="status-checks">
+              {/* Sound Toggle and Elegant Volume Slider */}
+              <div className="flex items-center gap-2 bg-stone-900 border border-stone-800 rounded-lg px-3 py-1.5" id="volume-wrapper">
+                <button
+                  id="sound-toggle"
+                  onClick={() => setSoundEnabled(!soundEnabled)}
+                  className={`transition-colors cursor-pointer ${soundEnabled && volume > 0 ? 'text-gold hover:text-amber-400' : 'text-stone-500 hover:text-stone-350'}`}
+                  title={soundEnabled ? 'Выключить звук' : 'Включить звук'}
+                >
+                  {soundEnabled && volume > 0 ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
+                </button>
+                <input
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  value={soundEnabled ? volume : 0}
+                  onChange={(e) => {
+                    const val = parseFloat(e.target.value);
+                    setVolume(val);
+                    if (val > 0 && !soundEnabled) {
+                      setSoundEnabled(true);
+                    }
+                  }}
+                  className="w-16 md:w-20 h-1 bg-stone-700 accent-gold rounded-lg appearance-none cursor-pointer"
+                  title={`Громкость: ${Math.round(volume * 100)}%`}
+                />
+                <span className="text-[10px] font-mono text-stone-500 w-8 text-right select-none">
+                  {Math.round((soundEnabled ? volume : 0) * 100)}%
+                </span>
+              </div>
 
-          {/* Status Panel (Sound & Network Check) */}
-          <div className="flex items-center gap-4" id="status-checks">
-            {/* Sound Toggle */}
-            <button
-              id="sound-toggle"
-              onClick={() => setSoundEnabled(!soundEnabled)}
-              className={`p-2.5 rounded-lg border transition-all ${
-                soundEnabled 
-                  ? 'border-gold/30 bg-stone-900 text-gold hover:bg-stone-800' 
-                  : 'border-stone-800 bg-stone-950 text-stone-500'
-              }`}
-              title={soundEnabled ? 'Звук включен' : 'Звук отключен'}
-            >
-              {soundEnabled ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
-            </button>
-
-            {/* Network indicator */}
-            <div className="flex items-center gap-2 px-3 py-1.5 bg-stone-950 rounded-lg border border-stone-800" id="connection-status">
-              <span className={`w-2.5 h-2.5 rounded-full ${wsConnected ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'}`} />
-              <span className="text-xs font-mono text-stone-400">
-                {wsConnected ? 'СИНХРОНИЗАЦИЯ' : 'ОФФЛАЙН'}
-              </span>
+              {/* Network indicator */}
+              <div className="flex items-center gap-2 px-3 py-1.5 bg-stone-950 rounded-lg border border-stone-800" id="connection-status">
+                <span className={`w-2.5 h-2.5 rounded-full ${wsConnected ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'}`} />
+                <span className="text-xs font-mono text-stone-400">
+                  {wsConnected ? 'СИНХРОНИЗАЦИЯ' : 'ОФФЛАЙН'}
+                </span>
+              </div>
             </div>
-          </div>
 
-        </div>
-      </header>
+          </div>
+        </header>
+      )}
 
       {/* 2. Main Content View Area */}
-      <main className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6" id="view-container">
+      <main className={`flex-1 w-full mx-auto transition-all duration-300 ${cleanMode && activeTab === 'overlay' ? 'max-w-none p-2 min-h-screen flex flex-col justify-center' : 'max-w-7xl p-4 md:p-6'}`} id="view-container">
+
+        {/* Clean Mode Hover Controller (Allows streamers to exit Clean Screen Mode easily) */}
+        {cleanMode && activeTab === 'overlay' && (
+          <div className="fixed top-4 right-4 z-50 opacity-10 hover:opacity-100 transition-opacity duration-300" id="clean-mode-floating-control">
+            <button
+              onClick={() => setCleanMode(false)}
+              className="bg-stone-950/95 text-stone-200 hover:text-gold border border-stone-800 px-4 py-2 rounded-xl shadow-2xl flex items-center gap-2 text-xs font-mono font-bold hover:border-gold/30 cursor-pointer"
+            >
+              <Tv className="w-4 h-4 text-emerald-400" />
+              <span>Показать панель управления</span>
+            </button>
+          </div>
+        )}
 
         {/* ==================== A. OVERLAY MODE ==================== */}
         {activeTab === 'overlay' && (
-          <div className="space-y-6 animate-fadeIn" id="overlay-ui">
+          <div className={`animate-fadeIn ${cleanMode ? 'space-y-2' : 'space-y-6'}`} id="overlay-ui">
             
-            {/* Upper Stage: Prominent Info Panel during setup & live status */}
-            <div className="flex flex-col md:flex-row items-center justify-between bg-stone-950/80 p-4 rounded-xl border border-gold/20 shadow-xl" id="setup-banner">
-              <div className="space-y-1">
-                <div className="flex items-center gap-2">
-                  <span className="text-xs bg-red-950 text-red-400 font-mono px-2 py-0.5 rounded border border-red-800/50">РЕДЖИМ ТРАНСЛЯЦИИ</span>
-                  <span className="text-xs text-stone-500">Захватите этот экран в OBS для вывода веб-камер на трансляцию</span>
+            {/* Upper Stage: Prominent Info Panel during setup & live status (Hidden in Clean Mode) */}
+            {!cleanMode && (
+              <div className="flex flex-col md:flex-row items-center justify-between bg-stone-950/80 p-5 rounded-xl border border-gold/20 shadow-xl gap-4" id="setup-banner">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs bg-red-950 text-red-450 font-mono px-2 py-0.5 rounded border border-red-800/40">РЕЖИМ ОБС</span>
+                    <span className="text-xs text-stone-400">Данную страницу стример выводит на трансляцию через захват экрана</span>
+                  </div>
+                  <p className="text-stone-300 text-sm">
+                    Участники заходят со своих устройств в <strong className="text-gold">"Кабинет Участника"</strong> для передачи веб-камер.
+                  </p>
                 </div>
-                <p className="text-stone-300 text-sm">
-                  Игроки могут присоединяться из вкладки <strong className="text-gold">"Кабинет Участника"</strong>, вводя свои ники и запуская веб-камеры.
-                </p>
-              </div>
 
-              {/* Status information */}
-              <div className="flex items-center gap-4 mt-3 md:mt-0 font-mono text-sm">
-                <span className="text-stone-400">Живых: <strong className="text-emerald-400 text-base">{gameState.slots.filter(s => s.id !== 12 && s.alive).length}</strong></span>
-                <span className="text-stone-500">|</span>
-                <span className="text-stone-400">Убитых: <strong className="text-red-400 text-base">{gameState.slots.filter(s => s.id !== 12 && !s.alive).length}</strong></span>
+                <div className="flex flex-wrap items-center gap-4">
+                  {/* Status indicators */}
+                  <div className="flex items-center gap-3 font-mono text-xs text-stone-400 bg-stone-900 border border-stone-850 px-3 py-1.5 rounded-lg">
+                    <span>Живых: <strong className="text-emerald-400 text-sm">{gameState.slots.filter(s => s.id !== 12 && s.alive).length}</strong></span>
+                    <span className="text-stone-700">|</span>
+                    <span>Мертвых: <strong className="text-red-400 text-sm">{gameState.slots.filter(s => s.id !== 12 && !s.alive).length}</strong></span>
+                  </div>
+
+                  {/* OBS Clean Mode button */}
+                  <button
+                    onClick={() => setCleanMode(true)}
+                    className="bg-amber-950/60 hover:bg-amber-900/80 text-gold border border-gold/35 px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 shadow-md cursor-pointer hover:scale-105 active:scale-95"
+                    title="Спрятать шапку, кнопки и фон для чистого захвата камер на Twitch"
+                  >
+                    <Tv className="w-4 h-4 text-emerald-400 animate-pulse" />
+                    <span>Чистая сетка (OBS)</span>
+                  </button>
+                </div>
               </div>
-            </div>
+            )}
 
             {/* TWITCH WEB-CAMERA GRID GRID */}
-            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4" id="cams-grid">
+            <div className={`grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-4 gap-4 ${cleanMode ? 'md:gap-3 lg:gap-2' : ''}`} id="cams-grid">
               
               {/* Slots 1 to 11 (Players Group) */}
-              {playerSlots.map((player) => (
-                <div 
-                  key={player.id} 
-                  id={`overlay-player-${player.id}`}
-                  className={`relative aspect-video rounded-xl overflow-hidden transition-all duration-500 flex flex-col justify-end ${
-                    player.alive 
-                      ? 'bg-leather-card border-gold/25 shadow-lg' 
-                      : 'bg-leather-card-dead saturate-50'
-                  }`}
-                >
-                  {/* Camera snapshot/live rendering container */}
-                  <div className="absolute inset-0 w-full h-full bg-stone-950/90 flex items-center justify-center overflow-hidden feed-scanlines">
-                    {player.alive ? (
-                      player.webcamFrame ? (
-                        <img 
-                          src={player.webcamFrame} 
-                          alt={player.name} 
-                          className="w-full h-full object-cover" 
-                          referrerPolicy="no-referrer"
-                        />
-                      ) : (
-                        <div className="flex flex-col items-center gap-2 text-stone-600">
-                          <VideoOff className="w-8 h-8" />
-                          <span className="text-[10px] font-mono tracking-widest uppercase">КАМЕРА ОТКЛЮЧЕНА</span>
-                        </div>
-                      )
-                    ) : (
-                      // If dead - show locked deathFrame with gray/subdued filters
-                      player.deathFrame ? (
-                        <img 
-                          src={player.deathFrame} 
-                          alt={`${player.name} RIP`} 
-                          className="w-full h-full object-cover filter grayscale contrast-125 sepia hover:sepia-0 duration-700 brightness-75"
-                          referrerPolicy="no-referrer"
-                        />
-                      ) : (
-                        <div className="flex flex-col items-center gap-1 text-red-950">
-                          <Skull className="w-10 h-10 animate-bounce" />
-                          <span className="text-[10px] font-mono tracking-widest text-red-900">БЕЗ КАДРА СМЕРТИ</span>
-                        </div>
-                      )
-                    )}
-
-                    {/* Dark gradient shadow behind labels */}
-                    <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-black/90 to-transparent z-10" />
-                  </div>
-
-                  {/* Player Slot Labels (Nick & Slot Index) */}
-                  <div className="relative z-10 p-2.5 flex items-center justify-between bg-stone-950/80 border-t border-stone-800" id={`label-player-${player.id}`}>
-                    <div className="flex items-center gap-1.5 min-w-0" id={`user-details-${player.id}`}>
-                      <span className="font-mono text-xs text-gold/80 font-bold bg-amber-950/80 px-1.5 py-0.5 rounded border border-gold/20 leading-none">
-                        {player.id}
-                      </span>
-                      <p className="font-semibold text-xs text-stone-200 truncate leading-none">
-                        {player.name}
-                      </p>
-                    </div>
-
-                    <div className="flex items-center gap-1.5">
-                      {player.connected ? (
-                        <span className="text-[9px] font-mono bg-emerald-950 text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-900/50">LIVE</span>
-                      ) : (
-                        <span className="text-[9px] font-mono bg-stone-900 text-stone-600 px-1.5 py-0.5 rounded border border-stone-850">DESK</span>
-                      )}
-                      
+              {playerSlots.map((player) => {
+                const recentFrame = webcamFramesRef.current[player.id] || player.webcamFrame;
+                const hasFrame = !!recentFrame;
+                
+                return (
+                  <div 
+                    key={player.id} 
+                    id={`overlay-player-${player.id}`}
+                    className={`relative aspect-video rounded-xl overflow-hidden transition-all duration-500 flex flex-col justify-end ${
+                      player.alive 
+                        ? 'bg-leather-card border border-gold/15 shadow-xl hover:border-gold/30' 
+                        : 'bg-leather-card-dead saturate-50 border border-red-950 shadow-md'
+                    }`}
+                  >
+                    {/* Camera snapshot/live rendering container */}
+                    <div className="absolute inset-0 w-full h-full bg-stone-950/95 flex items-center justify-center overflow-hidden feed-scanlines">
                       {player.alive ? (
-                        <Heart className="w-3.5 h-3.5 text-emerald-500 fill-emerald-500/25 shrink-0" />
+                        <>
+                          {/* Live 16:9 camera feed, direct-DOM optimized to prevent lag/rendering dropouts */}
+                          <img 
+                            id={`cam-feed-${player.id}`}
+                            src={recentFrame || ''} 
+                            alt={player.name} 
+                            className="w-full h-full object-cover aspect-video" 
+                            referrerPolicy="no-referrer"
+                            style={{ display: hasFrame ? 'block' : 'none' }}
+                          />
+                          
+                          {/* Off-line camera tag */}
+                          <div 
+                            id={`cam-fallback-${player.id}`}
+                            className="flex flex-col items-center gap-2 text-stone-700 animate-pulse"
+                            style={{ display: hasFrame ? 'none' : 'flex' }}
+                          >
+                            <VideoOff className="w-7 h-7" />
+                            <span className="text-[9px] font-mono tracking-widest uppercase">КАМЕРА ВЫКЛ</span>
+                          </div>
+                        </>
                       ) : (
-                        <Skull className="w-3.5 h-3.5 text-red-500 shrink-0" />
+                        // If dead - show locked deathFrame with gray/subdued filters
+                        player.deathFrame ? (
+                          <img 
+                            src={player.deathFrame} 
+                            alt={`${player.name} RIP`} 
+                            className="w-full h-full object-cover filter grayscale contrast-125 sepia hover:sepia-0 duration-700 brightness-75 aspect-video"
+                            referrerPolicy="no-referrer"
+                          />
+                        ) : (
+                          <div className="flex flex-col items-center gap-1 text-red-950">
+                            <Skull className="w-10 h-10 animate-bounce" />
+                            <span className="text-[9px] font-mono tracking-widest text-red-900">МЕРТВ</span>
+                          </div>
+                        )
                       )}
-                    </div>
-                  </div>
 
-                  {/* Red Diagonal Ribbons for Dead status (с ленточкой по диагонали "МЕРТВ") */}
-                  {!player.alive && (
-                    <div 
-                      className="absolute inset-0 flex items-center justify-center rotate-[-12deg] scale-[1.05] pointer-events-none z-20" 
-                      id={`death-badge-${player.id}`}
-                    >
-                      <div className="death-ribbon width-[120%] py-1.5 px-12 text-center uppercase text-sm font-bold tracking-widest select-none w-full border-t border-b border-red-900/40">
-                        МЁРТВ
+                      {/* Dark gradient shadow behind labels */}
+                      <div className="absolute bottom-0 left-0 right-0 h-10 bg-gradient-to-t from-black/90 to-transparent z-10" />
+                    </div>
+
+                    {/* Player Slot Labels (Nick & Slot Index) */}
+                    <div className="relative z-10 p-2 flex items-center justify-between bg-stone-950/85 border-t border-stone-900" id={`label-player-${player.id}`}>
+                      <div className="flex items-center gap-1.5 min-w-0" id={`user-details-${player.id}`}>
+                        <span className="font-mono text-[11px] text-gold font-bold bg-amber-950/85 px-1.5 py-0.5 rounded border border-gold/30 leading-none">
+                          {player.id}
+                        </span>
+                        <p className="font-semibold text-xs text-stone-200 truncate leading-none">
+                          {player.name}
+                        </p>
+                      </div>
+
+                      <div className="flex items-center gap-1 shrink-0">
+                        {player.connected ? (
+                          <span className="text-[8px] font-mono bg-emerald-950/60 text-emerald-400 px-1 py-0.5 rounded border border-emerald-900/40">LIVE</span>
+                        ) : (
+                          <span className="text-[8px] font-mono bg-stone-900/60 text-stone-500 px-1 py-0.5 rounded border border-stone-850">DESK</span>
+                        )}
+                        
+                        {player.alive ? (
+                          <Heart className="w-3.5 h-3.5 text-emerald-500 fill-emerald-500/20 shrink-0" />
+                        ) : (
+                          <Skull className="w-3.5 h-3.5 text-red-500 shrink-0" />
+                        )}
                       </div>
                     </div>
-                  )}
-                </div>
-              ))}
+
+                    {/* Red Diagonal Ribbons for Dead status */}
+                    {!player.alive && (
+                      <div 
+                        className="absolute inset-0 flex items-center justify-center rotate-[-12deg] scale-[1.05] pointer-events-none z-20 shadow-xl" 
+                        id={`death-badge-${player.id}`}
+                      >
+                        <div className="bg-red-800/90 text-stone-100 py-1 px-8 text-center uppercase text-[10px] font-black tracking-widest select-none w-full border-t border-b border-red-500/30">
+                          МЁРТВ
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
 
               {/* Host Webcamera Slot (Slot 12, always displayed as host at the bottom/end of grid) */}
-              {hostSlot && (
-                <div 
-                  id="overlay-host-card"
-                  className="relative aspect-video rounded-xl overflow-hidden bg-leather-card border-gold border-2 col-span-2 md:col-span-1 shadow-2xl flex flex-col justify-end"
-                >
-                  <div className="absolute inset-0 w-full h-full bg-stone-950/90 flex items-center justify-center overflow-hidden feed-scanlines">
-                    {hostSlot.webcamFrame ? (
+              {hostSlot && (() => {
+                const hostFrame = webcamFramesRef.current[12] || hostSlot.webcamFrame;
+                const hasHostFrame = !!hostFrame;
+
+                return (
+                  <div 
+                    id="overlay-host-card"
+                    className="relative aspect-video rounded-xl overflow-hidden bg-leather-card border-gold border rounded-xl col-span-2 sm:col-span-1 shadow-2xl flex flex-col justify-end"
+                  >
+                    <div className="absolute inset-0 w-full h-full bg-stone-950/95 flex items-center justify-center overflow-hidden feed-scanlines">
+                      {/* Live 16:9 Host Webcam Feed, direct-DOM optimized */}
                       <img 
-                        src={hostSlot.webcamFrame} 
+                        id="cam-feed-12"
+                        src={hostFrame || ''} 
                         alt={hostSlot.name} 
-                        className="w-full h-full object-cover" 
+                        className="w-full h-full object-cover aspect-video" 
                         referrerPolicy="no-referrer"
+                        style={{ display: hasHostFrame ? 'block' : 'none' }}
                       />
-                    ) : (
-                      <div className="flex flex-col items-center gap-2 text-stone-700 text-center uppercase p-3">
-                        <Crown className="w-10 h-10 text-gold/30 animate-pulse" />
-                        <span className="text-[10px] font-mono tracking-widest">ВЕДУЩИЙ ОТКЛЮЧЕН</span>
+                      
+                      {/* Host offline tag */}
+                      <div 
+                        id="cam-fallback-12"
+                        className="flex flex-col items-center gap-2 text-stone-700 text-center uppercase p-3 animate-pulse"
+                        style={{ display: hasHostFrame ? 'none' : 'flex' }}
+                      >
+                        <Crown className="w-8 h-8 text-gold/25" />
+                        <span className="text-[9px] font-mono tracking-widest">ВЕДУЩИЙ ВЫКЛ</span>
                       </div>
-                    )}
-                    <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-black/90 to-transparent z-10" />
-                  </div>
-
-                  {/* Host Label bar with high glow crown status */}
-                  <div className="relative z-10 p-2.5 flex items-center justify-between bg-stone-950/95 border-t-2 border-gold/40" id="host-label-bar">
-                    <div className="flex items-center gap-1.5 min-w-0">
-                      <span className="font-mono text-center text-xs text-stone-950 font-bold bg-gold px-1.5 py-0.5 rounded border border-gold leading-none">
-                        👑
-                      </span>
-                      <p className="font-serif font-bold text-sm text-gold tracking-wider truncate leading-none uppercase">
-                        {hostSlot.name}
-                      </p>
+                      <div className="absolute bottom-0 left-0 right-0 h-10 bg-gradient-to-t from-black/90 to-transparent z-10" />
                     </div>
 
-                    <div className="flex items-center gap-1.5">
-                      <span className="text-[9px] font-mono bg-amber-950 text-gold px-1.5 py-0.5 rounded border border-gold/30">ВЕДУЩИЙ</span>
+                    {/* Host Label bar with high glow crown status */}
+                    <div className="relative z-10 p-2 flex items-center justify-between bg-stone-950/95 border-t border-gold/20" id="host-label-bar">
+                      <div className="flex items-center gap-1.5 min-w-0">
+                        <span className="font-mono text-center text-[10px] text-stone-950 font-bold bg-gold px-1.5 py-0.5 rounded leading-none">
+                          👑
+                        </span>
+                        <p className="font-serif font-bold text-xs text-gold tracking-wider truncate leading-none uppercase">
+                          {hostSlot.name}
+                        </p>
+                      </div>
+
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-[8px] font-mono bg-amber-950/60 text-gold px-1.5 py-0.5 rounded border border-gold/20">ВЕДУЩИЙ</span>
+                      </div>
                     </div>
                   </div>
-                </div>
-              )}
+                );
+              })()}
 
             </div>
           </div>
@@ -1157,15 +1268,6 @@ export default function App() {
           </motion.div>
         )}
       </AnimatePresence>
-
-      {/* 4. Elegant classic vintage wood bottom footer status info */}
-      <footer className="bg-stone-950/90 py-4 px-6 border-t border-stone-900 mt-auto text-center" id="footer-panel">
-        <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-center justify-between text-xs text-stone-500 font-mono gap-2">
-          <span>© 1930 - 2026 Мафия Тафида. Все права защищены.</span>
-          <span className="text-stone-600 font-serif">"La Cosa Nostra - Преданность и Закон Омерты"</span>
-          <span className="text-gold/45">Разработано для стримеров на Twitch с Discord голосованием.</span>
-        </div>
-      </footer>
 
     </div>
   );

@@ -14,7 +14,7 @@ function getAudioContext(): AudioContext {
 }
 
 // Gunshot + Tragic Resonance (for player deaths)
-export function playGunshotSound() {
+export function playGunshotSound(volume: number = 1.0) {
   try {
     const ctx = getAudioContext();
     const now = ctx.currentTime;
@@ -39,8 +39,8 @@ export function playGunshotSound() {
 
     // Noise gain (quick decay)
     const noiseGain = ctx.createGain();
-    noiseGain.gain.setValueAtTime(1.5, now);
-    noiseGain.gain.exponentialRampToValueAtTime(0.01, now + 0.25);
+    noiseGain.gain.setValueAtTime(1.5 * volume, now);
+    noiseGain.gain.exponentialRampToValueAtTime(0.01 * volume, now + 0.25);
 
     noiseNode.connect(noiseFilter);
     noiseFilter.connect(noiseGain);
@@ -54,8 +54,8 @@ export function playGunshotSound() {
     kickOsc.frequency.setValueAtTime(150, now);
     kickOsc.frequency.exponentialRampToValueAtTime(30, now + 0.2);
 
-    kickGain.gain.setValueAtTime(1.5, now);
-    kickGain.gain.exponentialRampToValueAtTime(0.01, now + 0.25);
+    kickGain.gain.setValueAtTime(1.5 * volume, now);
+    kickGain.gain.exponentialRampToValueAtTime(0.01 * volume, now + 0.25);
 
     kickOsc.connect(kickGain);
     kickGain.connect(ctx.destination);
@@ -73,8 +73,8 @@ export function playGunshotSound() {
       osc.frequency.setValueAtTime(freq, now + delay);
 
       oscGain.gain.setValueAtTime(0, now);
-      oscGain.gain.linearRampToValueAtTime(0.12, now + delay + 0.05);
-      oscGain.gain.exponentialRampToValueAtTime(0.001, now + delay + 1.8);
+      oscGain.gain.linearRampToValueAtTime(0.12 * volume, now + delay + 0.05);
+      oscGain.gain.exponentialRampToValueAtTime(0.001 * volume, now + delay + 1.8);
 
       osc.connect(oscGain);
       oscGain.connect(ctx.destination);
@@ -96,7 +96,7 @@ export function playGunshotSound() {
 }
 
 // Mafia Victory (Ominous, heavy minor synth/horns)
-export function playMafiaVictorySound() {
+export function playMafiaVictorySound(volume: number = 1.0) {
   try {
     const ctx = getAudioContext();
     const now = ctx.currentTime;
@@ -121,8 +121,8 @@ export function playMafiaVictorySound() {
 
       // Amplitude envelop: fade in slightly, then long decay
       gain.gain.setValueAtTime(0, now);
-      gain.gain.linearRampToValueAtTime(0.18, now + 0.1);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 3.0);
+      gain.gain.linearRampToValueAtTime(0.18 * volume, now + 0.1);
+      gain.gain.exponentialRampToValueAtTime(0.001 * volume, now + 3.0);
 
       osc.connect(filter);
       filter.connect(gain);
@@ -143,8 +143,8 @@ export function playMafiaVictorySound() {
       bellOsc.frequency.setValueAtTime(freq, now + bellDelay);
 
       bellGain.gain.setValueAtTime(0, now);
-      bellGain.gain.linearRampToValueAtTime(0.08, now + bellDelay + 0.05);
-      bellGain.gain.exponentialRampToValueAtTime(0.001, now + bellDelay + 1.5);
+      bellGain.gain.linearRampToValueAtTime(0.08 * volume, now + bellDelay + 0.05);
+      bellGain.gain.exponentialRampToValueAtTime(0.001 * volume, now + bellDelay + 1.5);
 
       bellOsc.connect(bellGain);
       bellGain.connect(ctx.destination);
@@ -159,7 +159,7 @@ export function playMafiaVictorySound() {
 }
 
 // Civilians Victory (Majestic, celebratory triumphant brass)
-export function playCiviliansVictorySound() {
+export function playCiviliansVictorySound(volume: number = 1.0) {
   try {
     const ctx = getAudioContext();
     const now = ctx.currentTime;
@@ -185,8 +185,8 @@ export function playCiviliansVictorySound() {
       filter.frequency.linearRampToValueAtTime(1000, now + 2.5);
 
       gain.gain.setValueAtTime(0, now);
-      gain.gain.linearRampToValueAtTime(0.14, now + 0.08);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 3.0);
+      gain.gain.linearRampToValueAtTime(0.14 * volume, now + 0.08);
+      gain.gain.exponentialRampToValueAtTime(0.001 * volume, now + 3.0);
 
       osc.connect(filter);
       filter.connect(gain);
@@ -207,8 +207,8 @@ export function playCiviliansVictorySound() {
       harpOsc.frequency.setValueAtTime(freq, now + harpDelay);
 
       harpGain.gain.setValueAtTime(0, now);
-      harpGain.gain.linearRampToValueAtTime(0.1, now + harpDelay + 0.02);
-      harpGain.gain.exponentialRampToValueAtTime(0.001, now + harpDelay + 1.2);
+      harpGain.gain.linearRampToValueAtTime(0.1 * volume, now + harpDelay + 0.02);
+      harpGain.gain.exponentialRampToValueAtTime(0.001 * volume, now + harpDelay + 1.2);
 
       harpOsc.connect(harpGain);
       harpGain.connect(ctx.destination);
