@@ -28,7 +28,7 @@ import {
 } from './audio';
 
 // Constants
-const WEBCAM_FPS = 8; // Stable, smooth FPS that won't overload websockets
+const WEBCAM_FPS = 15; // Stable, smooth FPS that won't overload websockets
 const WS_RECONNECT_INTERVAL = 3000;
 
 // Inline worker to force background timer execution without browser throttling (1000ms clamp)
@@ -163,6 +163,10 @@ export default function App() {
               }
             });
           } else if (data.type === 'webcam') {
+            // Ignore our own incoming frames so they don't overwrite the much faster local preview with delayed frames causing jitter
+            if (data.slotId === currentSlotIdRef.current) {
+              return;
+            }
             // Save webcam frame into mutable reference to bypass React render completely (extreme speed boost)
             webcamFramesRef.current[data.slotId] = data.frame;
 
@@ -268,13 +272,13 @@ export default function App() {
             const canvas = globalCanvasRef.current;
             const context = canvas.getContext('2d');
             if (context) {
-              // Ensure size is exactly 16:9 (320x180) to look perfectly crisp but ultra-fast
-              canvas.width = 320;
-              canvas.height = 180;
-              context.drawImage(vid, 0, 0, 320, 180);
+              // Ensure size is exactly 16:9 (480x270) to look perfectly crisp
+              canvas.width = 480;
+              canvas.height = 270;
+              context.drawImage(vid, 0, 0, 480, 270);
               
-              // Compress to jpeg
-              const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.25);
+              // Compress to jpeg for faster main thread encoding (WebP is too slow and causes mouth latency)
+              const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.40);
               
               // IMMEDIATELY update local ref so the Overlay tab can see our own camera without waiting for server response
               if (currentPlayerSlotId) {
@@ -723,12 +727,12 @@ export default function App() {
                           </div>
                         </>
                       ) : (
-                        // If dead - show locked deathFrame with gray/subdued filters
+                        // If dead - just show the offline screen with death tag, but keep original if needed, or normal styling
                         player.deathFrame ? (
                           <img 
                             src={player.deathFrame} 
                             alt={`${player.name} RIP`} 
-                            className="w-full h-full object-cover filter grayscale contrast-125 sepia hover:sepia-0 duration-700 brightness-75 aspect-video"
+                            className="w-full h-full object-cover aspect-video"
                             referrerPolicy="no-referrer"
                           />
                         ) : (
@@ -769,17 +773,7 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* Red Diagonal Ribbons for Dead status */}
-                    {!player.alive && (
-                      <div 
-                        className="absolute inset-0 flex items-center justify-center rotate-[-12deg] scale-[1.05] pointer-events-none z-20 shadow-xl" 
-                        id={`death-badge-${player.id}`}
-                      >
-                        <div className="bg-red-800/90 text-stone-100 py-1 px-8 text-center uppercase text-[10px] font-black tracking-widest select-none w-full border-t border-b border-red-500/30">
-                          МЁРТВ
-                        </div>
-                      </div>
-                    )}
+                    
                   </div>
                 );
               })}
