@@ -28,7 +28,7 @@ import {
 } from './audio';
 
 // Constants
-const WEBCAM_FPS = 3; // Ultra compact interval frame rate to eliminate server load and prevent webcam lag
+const WEBCAM_FPS = 10; // Smooth 10 FPS for network transmission (local video will be full FPS)
 const WS_RECONNECT_INTERVAL = 3000;
 
 export default function App() {
@@ -192,12 +192,11 @@ export default function App() {
   // 2. Local Desktop Webcame capture handler
   useEffect(() => {
     if (isWebcamActive && activeTab === 'player' && currentPlayerSlotId) {
-      // Initalize camera using ideal standard 16:9 aspect ratio
+      // Initalize camera using ideal standard 16:9 HD resolution for local fluid preview
       navigator.mediaDevices.getUserMedia({ 
         video: { 
-          width: { ideal: 320 }, 
-          height: { ideal: 180 }, 
-          frameRate: { ideal: WEBCAM_FPS } 
+          width: { ideal: 1280 }, 
+          height: { ideal: 720 }, 
         }, 
         audio: false 
       })
@@ -218,13 +217,13 @@ export default function App() {
           if (videoRef.current && canvasRef.current && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
             const context = canvasRef.current.getContext('2d');
             if (context) {
-              // Ensure size is exactly 16:9 (240x135) to look absolutely perfect, crisp and natural
-              canvasRef.current.width = 240;
-              canvasRef.current.height = 135;
-              context.drawImage(videoRef.current, 0, 0, 240, 135);
+              // Ensure size is exactly 16:9 (480x270) to look absolutely perfect, crisp and natural
+              canvasRef.current.width = 480;
+              canvasRef.current.height = 270;
+              context.drawImage(videoRef.current, 0, 0, 480, 270);
               
-              // Compress to jpeg with specialized quality 0.15 (approx 4-5 KB) to save 10x bandwidth
-              const jpegDataUrl = canvasRef.current.toDataURL('image/jpeg', 0.15);
+              // Compress to jpeg with higher quality since we raised constraints
+              const jpegDataUrl = canvasRef.current.toDataURL('image/jpeg', 0.4);
               
               // Send off
               wsRef.current.send(JSON.stringify({
