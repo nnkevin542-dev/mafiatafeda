@@ -1,6 +1,10 @@
 {
-  "name": "Мафия Тафида",
+  "name": "Remix: Мафия Тафида",
   "description": "Интерактивный пульт управления и оверлей веб-камер для проведения игр в Мафию с Twitch-вещанием и Discord.",
-  "requestFramePermissions": ["camera"],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

@@ -28,7 +28,7 @@ import {
 } from './audio';
 
 // Constants
-const WEBCAM_FPS = 15; // Stable, smooth FPS that won't overload websockets
+const WEBCAM_FPS = 24; // Increased FPS for smoother motion
 const WS_RECONNECT_INTERVAL = 3000;
 
 // Inline worker to force background timer execution without browser throttling (1000ms clamp)
@@ -72,6 +72,9 @@ export default function App() {
   const [cleanMode, setCleanMode] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [currentPlayerSlotId, setCurrentPlayerSlotId] = useState<number | null>(null);
+  const [selectedSlotId, setSelectedSlotId] = useState<number | null>(null);
+  const [isHostAuthenticated, setIsHostAuthenticated] = useState(false);
+  const [hostPassword, setHostPassword] = useState('');
   const [playerNickname, setPlayerNickname] = useState('');
   const [isWebcamActive, setIsWebcamActive] = useState(false);
   const [mockCameraEnabled, setMockCameraEnabled] = useState(false);
@@ -125,7 +128,7 @@ export default function App() {
           ws.send(JSON.stringify({
             type: 'join',
             slotId: currentSlotIdRef.current,
-            name: currentNicknameRef.current || 'Возврат'
+            name: currentNicknameRef.current || (currentSlotIdRef.current === 12 ? 'Ведущий' : `Игрок ${currentSlotIdRef.current}`)
           }));
         }
       };
@@ -265,20 +268,20 @@ export default function App() {
           // Do not pause on visibilityState so OBS/Twitch captures continue without lag when streamer minimizes
           if (vid && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
             // CRITICAL: Drop frames if the connection is struggling to keep up to eliminate 1-second delay lag
-            if (wsRef.current.bufferedAmount > 1024 * 64) {
+            if (wsRef.current.bufferedAmount > 1024 * 128) {
               return; // Skip this frame to prevent buffer bloat
             }
             
             const canvas = globalCanvasRef.current;
             const context = canvas.getContext('2d');
             if (context) {
-              // Ensure size is exactly 16:9 (480x270) to look perfectly crisp
-              canvas.width = 480;
-              canvas.height = 270;
-              context.drawImage(vid, 0, 0, 480, 270);
+              // Ensure size is exactly 16:9 (640x360) to look perfectly crisp and provide better quality
+              canvas.width = 640;
+              canvas.height = 360;
+              context.drawImage(vid, 0, 0, 640, 360);
               
               // Compress to jpeg for faster main thread encoding (WebP is too slow and causes mouth latency)
-              const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.40);
+              const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.65);
               
               // IMMEDIATELY update local ref so the Overlay tab can see our own camera without waiting for server response
               if (currentPlayerSlotId) {
@@ -454,6 +457,26 @@ export default function App() {
     }
   };
 
+  const handleSetVoteStatus = (slotId: number, onVote: boolean) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'set_vote_status',
+        slotId,
+        onVote
+      }));
+    }
+  };
+
+  const handleSetVoteCount = (slotId: number, voteCount: number) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'set_vote_count',
+        slotId,
+        voteCount
+      }));
+    }
+  };
+
   const handleUpdateSlotName = (slotId: number, currentName: string) => {
     const newName = prompt(`Редактировать имя игрока #${slotId}:`, currentName);
     if (newName !== null) {
@@ -489,15 +512,18 @@ export default function App() {
   // 4. Lobby User Join / Leave actions
   const handleJoinLobby = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!currentPlayerSlotId) {
+    if (!selectedSlotId) {
       alert('Пожалуйста, выберите номер слота для участия в игре!');
       return;
     }
 
+    // Set the finalized slot
+    setCurrentPlayerSlotId(selectedSlotId);
+
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({
         type: 'join',
-        slotId: currentPlayerSlotId,
+        slotId: selectedSlotId,
         name: playerNickname.trim()
       }));
       // Enable camera feed by default on join
@@ -514,12 +540,19 @@ export default function App() {
       setIsWebcamActive(false);
       setMockCameraEnabled(false);
       setCurrentPlayerSlotId(null);
+      setSelectedSlotId(null);
     }
   };
 
   // Helper selectors
   const hostSlot = gameState.slots.find(s => s.id === 12);
   const playerSlots = gameState.slots.filter(s => s.id !== 12);
+
+  const getVotesWord = (count: number) => {
+    if (count === 1) return 'ГОЛОС';
+    if (count >= 2 && count <= 4) return 'ГОЛОСА';
+    return 'ГОЛОСОВ';
+  };
 
   return (
     <div className="min-h-screen bg-wood-pattern text-stone-200 flex flex-col font-sans selection:bg-amber-950 selection:text-amber-200" id="mafia-app-root">
@@ -698,7 +731,7 @@ export default function App() {
                     id={`overlay-player-${player.id}`}
                     className={`relative aspect-video rounded-xl overflow-hidden transition-all duration-500 flex flex-col justify-end ${
                       player.alive 
-                        ? 'bg-leather-card border border-gold/15 shadow-xl hover:border-gold/30' 
+                        ? (player.onVote ? 'bg-red-950 border-[3px] border-red-600 shadow-[0_0_30px_rgba(220,38,38,0.7)] z-10 scale-[1.02]' : 'bg-leather-card border border-gold/15 shadow-xl hover:border-gold/30') 
                         : 'bg-leather-card-dead saturate-50 border border-red-950 shadow-md'
                     }`}
                   >
@@ -725,22 +758,36 @@ export default function App() {
                             <VideoOff className="w-7 h-7" />
                             <span className="text-[9px] font-mono tracking-widest uppercase">КАМЕРА ВЫКЛ</span>
                           </div>
+
+                          {/* Voting Indicator Overlay */}
+                          {player.onVote && (
+                            <div className="absolute top-2 right-2 bg-red-600/90 text-red-50 px-3 py-1 rounded border border-red-400 font-bold font-mono text-sm shadow-lg animate-pulse" style={{ textShadow: '0 1px 2px rgba(0,0,0,0.8)' }}>
+                              НА ГОЛОСОВАНИИ
+                            </div>
+                          )}
                         </>
                       ) : (
                         // If dead - just show the offline screen with death tag, but keep original if needed, or normal styling
-                        player.deathFrame ? (
-                          <img 
-                            src={player.deathFrame} 
-                            alt={`${player.name} RIP`} 
-                            className="w-full h-full object-cover aspect-video"
-                            referrerPolicy="no-referrer"
-                          />
-                        ) : (
-                          <div className="flex flex-col items-center gap-1 text-red-950">
-                            <Skull className="w-10 h-10 animate-bounce" />
-                            <span className="text-[9px] font-mono tracking-widest text-red-900">МЕРТВ</span>
+                        <>
+                          {player.deathFrame ? (
+                            <img 
+                              src={player.deathFrame} 
+                              alt={`${player.name} RIP`} 
+                              className="w-full h-full object-cover aspect-video saturate-0 brightness-50"
+                              referrerPolicy="no-referrer"
+                            />
+                          ) : (
+                            <div className="flex flex-col items-center gap-1 text-red-950">
+                              <Skull className="w-10 h-10 animate-bounce" />
+                              <span className="text-[9px] font-mono tracking-widest text-red-900">МЕРТВ</span>
+                            </div>
+                          )}
+                          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                            <div className="death-ribbon px-8 py-2 rotate-[-15deg] uppercase font-bold text-lg opacity-90 border-y-2 border-red-950/50 shadow-2xl backdrop-blur-sm line-through decoration-red-950 decoration-4 text-red-200">
+                              МЁРТВ
+                            </div>
                           </div>
-                        )
+                        </>
                       )}
 
                       {/* Dark gradient shadow behind labels */}
@@ -759,6 +806,11 @@ export default function App() {
                       </div>
 
                       <div className="flex items-center gap-1 shrink-0">
+                        {player.onVote && player.voteCount !== undefined && player.voteCount > 0 && (
+                          <span className="text-[9px] font-bold text-red-50 bg-red-600 px-1.5 py-0.5 rounded border border-red-400 mr-1 animate-pulse shadow-[0_0_5px_rgba(220,38,38,0.8)]">
+                            {player.voteCount} {getVotesWord(player.voteCount)}
+                          </span>
+                        )}
                         {player.connected ? (
                           <span className="text-[8px] font-mono bg-emerald-950/60 text-emerald-400 px-1 py-0.5 rounded border border-emerald-900/40">LIVE</span>
                         ) : (
@@ -874,11 +926,14 @@ export default function App() {
                         <button
                           key={slot.id}
                           type="button"
-                          onClick={() => setCurrentPlayerSlotId(slot.id)}
-                          className={`p-3 rounded-lg border text-center transition-all ${
+                          disabled={isOccupied}
+                          onClick={() => !isOccupied && setSelectedSlotId(slot.id)}
+                          className={`p-3 rounded-lg border text-center transition-all cursor-pointer disabled:cursor-not-allowed ${
                             isOccupied 
-                              ? 'bg-stone-900 border-stone-800 text-stone-600 cursor-not-allowed' 
-                              : 'border-stone-700 bg-stone-900 text-stone-300 hover:border-gold/50 hover:bg-stone-850'
+                              ? 'bg-stone-900 border-stone-800 text-stone-600' 
+                              : selectedSlotId === slot.id
+                                ? 'border-gold bg-stone-800 text-gold shadow-[0_0_10px_rgba(223,186,115,0.4)]'
+                                : 'border-stone-700 bg-stone-900 text-stone-300 hover:border-gold/50 hover:bg-stone-850'
                           }`}
                         >
                           <span className="block text-lg font-mono font-bold">{slot.id === 12 ? '👑' : slot.id}</span>
@@ -1016,7 +1071,51 @@ export default function App() {
 
 
         {/* ==================== C. HOST CONTROL PANEL ==================== */}
-        {activeTab === 'host' && (
+        {activeTab === 'host' && !isHostAuthenticated && (
+          <div className="max-w-md mx-auto bg-stone-950/80 p-8 rounded-2xl border border-gold/25 shadow-2xl text-center space-y-6 mt-12 animate-fadeIn" id="host-login">
+             <Crown className="w-16 h-16 text-gold mx-auto mb-4 opacity-80" />
+             <div className="space-y-1">
+               <h2 className="text-2xl font-serif text-gold uppercase font-bold tracking-wider">Пульт Ведущего</h2>
+               <p className="text-xs text-stone-400">Требуется код доступа администратора</p>
+             </div>
+             
+             <div className="space-y-4">
+               <input 
+                 type="password" 
+                 value={hostPassword} 
+                 onChange={(e) => setHostPassword(e.target.value)} 
+                 onKeyDown={(e) => {
+                   if (e.key === 'Enter') {
+                     if (hostPassword === '67829321') {
+                       setIsHostAuthenticated(true);
+                     } else {
+                       alert('Неверный код доступа');
+                       setHostPassword('');
+                     }
+                   }
+                 }}
+                 className="w-full bg-stone-900 border border-stone-800 focus:border-gold/50 rounded-lg p-3.5 text-stone-200 text-center font-mono text-xl tracking-widest outline-none transition-all shadow-inner" 
+                 placeholder="••••••••" 
+                 autoFocus
+               />
+               <button 
+                 onClick={() => { 
+                   if (hostPassword === '67829321') {
+                     setIsHostAuthenticated(true); 
+                   } else { 
+                     alert('Неверный код доступа'); 
+                     setHostPassword('');
+                   } 
+                 }} 
+                 className="w-full bg-brass text-stone-950 font-bold py-3.5 rounded-lg hover:brightness-110 active:brightness-90 uppercase tracking-widest transition-all cursor-pointer shadow-lg"
+               >
+                 Авторизация
+               </button>
+             </div>
+          </div>
+        )}
+
+        {activeTab === 'host' && isHostAuthenticated && (
           <div className="space-y-6 animate-fadeIn" id="host-deck">
             
             {/* Real-time Administrator Master Controls Panel */}
@@ -1145,10 +1244,10 @@ export default function App() {
                       </div>
 
                       {/* Visual status indicators and action buttons */}
-                      <div className="flex items-center gap-3">
+                      <div className="flex flex-wrap sm:flex-nowrap items-center gap-3 justify-end flex-1">
                         
                         {/* Status Label badge */}
-                        <div className="text-right mr-2 hidden sm:block">
+                        <div className="text-right mr-2 hidden xl:block">
                           {slot.alive ? (
                             <span className="text-xs font-mono text-emerald-400 bg-emerald-950/50 border border-emerald-900/40 px-2 py-0.5 rounded">Живой</span>
                           ) : (
@@ -1157,13 +1256,50 @@ export default function App() {
                         </div>
 
                         {/* Webcam Capture State Indicator */}
-                        <div className="w-12 h-9 rounded bg-stone-950 border border-stone-850 overflow-hidden flex items-center justify-center" title="Мини-фид">
+                        <div className="w-12 h-9 rounded bg-stone-950 border border-stone-850 overflow-hidden flex shrink-0 items-center justify-center" title="Мини-фид">
                           {slot.webcamFrame ? (
                             <img src={slot.webcamFrame} alt="Mini-Cam" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
                           ) : (
                             <VideoOff className="w-4 h-4 text-stone-800" />
                           )}
                         </div>
+
+                        {/* VOTE MANAGEMENT */}
+                        {!isHost && slot.alive && (
+                          <div className="flex items-center gap-2 bg-stone-900 p-1 rounded-lg border border-stone-800 shrink-0">
+                             <button
+                               onClick={() => handleSetVoteStatus(slot.id, !slot.onVote)}
+                               className={`px-3 py-1.5 text-[10px] sm:text-xs font-bold rounded flex items-center transition-all border outline-none cursor-pointer ${
+                                 slot.onVote
+                                   ? 'bg-red-900/80 border-red-500 text-red-100 shadow-[0_0_8px_rgba(239,68,68,0.3)]'
+                                   : 'bg-stone-800 border-stone-700 text-stone-400 hover:text-stone-300'
+                               }`}
+                               title="Выставить на голосование"
+                             >
+                               {slot.onVote ? 'НА ГОЛОСОВАНИИ' : 'На голосование'}
+                             </button>
+
+                             {slot.onVote && (
+                               <div className="flex items-center gap-1 bg-stone-950/50 p-1 rounded border border-stone-800">
+                                 <button
+                                   onClick={() => handleSetVoteCount(slot.id, Math.max(0, (slot.voteCount || 0) - 1))}
+                                   className="w-6 h-6 flex justify-center items-center rounded bg-stone-800 hover:bg-stone-700 text-stone-300 font-mono font-bold cursor-pointer"
+                                 >
+                                   -
+                                 </button>
+                                 <span className="text-xs font-mono font-bold text-red-400 w-4 text-center">
+                                   {slot.voteCount || 0}
+                                 </span>
+                                 <button
+                                   onClick={() => handleSetVoteCount(slot.id, (slot.voteCount || 0) + 1)}
+                                   className="w-6 h-6 flex justify-center items-center rounded bg-stone-800 hover:bg-stone-700 text-stone-300 font-mono font-bold cursor-pointer"
+                                 >
+                                   +
+                                 </button>
+                               </div>
+                             )}
+                          </div>
+                        )}
 
                         {/* Action buttons (Toggling live status) */}
                         {!isHost && (

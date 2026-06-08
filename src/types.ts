@@ -6,6 +6,8 @@ export interface PlayerSlot {
   connectionId: string | null; // socket ID
   webcamFrame: string | null; // latest live jpeg/webp base64 frame
   deathFrame: string | null; // frozen frame when the player was killed
+  onVote?: boolean;
+  voteCount?: number;
 }
 
 export interface KillAnnouncement {
@@ -29,4 +31,6 @@ export type SocketMessage =
   | { type: 'victory'; victory: 'mafia' | 'civilians' | null }
   | { type: 'reset_game' }
   | { type: 'state_update'; state: GameState }
-  | { type: 'trigger_kill'; playerId: number; name: string };
+  | { type: 'trigger_kill'; playerId: number; name: string }
+  | { type: 'set_vote_status'; slotId: number; onVote: boolean }
+  | { type: 'set_vote_count'; slotId: number; voteCount: number };

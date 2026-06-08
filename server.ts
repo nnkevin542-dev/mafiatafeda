@@ -19,6 +19,8 @@ async function startServer() {
     connectionId: null,
     webcamFrame: null,
     deathFrame: null,
+    onVote: false,
+    voteCount: 0,
   }));
 
   let gameState: GameState = {
@@ -150,8 +152,31 @@ async function startServer() {
             gameState.slots.forEach((s) => {
               s.alive = true;
               s.deathFrame = null;
+              s.onVote = false;
+              s.voteCount = 0;
             });
             broadcastState();
+            break;
+          }
+
+          case "set_vote_status": {
+            const slot = gameState.slots.find((s) => s.id === msg.slotId);
+            if (slot) {
+              slot.onVote = msg.onVote;
+              if (!msg.onVote) {
+                slot.voteCount = 0; // reset votes if taken off vote
+              }
+              broadcastState();
+            }
+            break;
+          }
+
+          case "set_vote_count": {
+            const slot = gameState.slots.find((s) => s.id === msg.slotId);
+            if (slot) {
+              slot.voteCount = msg.voteCount;
+              broadcastState();
+            }
             break;
           }
 
