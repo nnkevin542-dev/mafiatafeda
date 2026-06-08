@@ -31,20 +31,6 @@ import {
 const WEBCAM_FPS = 8; // Stable, smooth FPS that won't overload websockets
 const WS_RECONNECT_INTERVAL = 3000;
 
-// Inline worker to force background timer execution without browser throttling (1000ms clamp)
-const hardWorkerBlob = new Blob([`
-  let timerId = null;
-  self.onmessage = function(e) {
-    if (e.data.action === 'start') {
-      if (timerId) clearInterval(timerId);
-      timerId = setInterval(() => self.postMessage('tick'), e.data.ms);
-    } else if (e.data.action === 'stop') {
-      clearInterval(timerId);
-      timerId = null;
-    }
-  }
-`], { type: 'application/javascript' });
-
 export default function App() {
   // Navigation tabs: 'overlay' | 'host' | 'player'
   const [activeTab, setActiveTab] = useState<'overlay' | 'host' | 'player'>('overlay');
@@ -85,8 +71,6 @@ export default function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const cameraWorkerRef = useRef<Worker | null>(null);
-  const mockWorkerRef = useRef<Worker | null>(null);
   const captureIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const webcamFramesRef = useRef<Record<number, string>>({});
 
@@ -234,24 +218,25 @@ export default function App() {
           vid.play().catch(e => console.warn('Global video play failed:', e));
         };
 
-        // Setup ticked canvas snapshot using background web-worker
-        if (!cameraWorkerRef.current) {
-          cameraWorkerRef.current = new Worker(URL.createObjectURL(hardWorkerBlob));
-        }
-
-        cameraWorkerRef.current.onmessage = () => {
+        // Setup ticked canvas snapshot
+        captureIntervalRef.current = setInterval(() => {
           // Do not pause on visibilityState so OBS/Twitch captures continue without lag when streamer minimizes
           if (vid && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            // CRITICAL: Drop frames if the connection is struggling to keep up to eliminate 1-second delay lag
+            if (wsRef.current.bufferedAmount > 1024 * 64) {
+              return; // Skip this frame to prevent buffer bloat
+            }
+            
             const canvas = globalCanvasRef.current;
             const context = canvas.getContext('2d');
             if (context) {
-              // Ensure size is exactly 16:9 (480x270) to look absolutely perfect, crisp and natural
-              canvas.width = 480;
-              canvas.height = 270;
-              context.drawImage(vid, 0, 0, 480, 270);
+              // Ensure size is exactly 16:9 (320x180) to look perfectly crisp but ultra-fast
+              canvas.width = 320;
+              canvas.height = 180;
+              context.drawImage(vid, 0, 0, 320, 180);
               
-              // Compress to jpeg with higher quality since we raised constraints
-              const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.4);
+              // Compress to jpeg
+              const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.25);
               
               // Send off
               wsRef.current.send(JSON.stringify({
@@ -261,9 +246,7 @@ export default function App() {
               }));
             }
           }
-        };
-
-        cameraWorkerRef.current.postMessage({ action: 'start', ms: 1000 / WEBCAM_FPS });
+        }, 1000 / WEBCAM_FPS);
       })
       .catch((err) => {
         console.error('Error starting camera stream:', err);
@@ -272,8 +255,9 @@ export default function App() {
       });
     } else {
       // Clean up camera slots when explicitly turned off
-      if (cameraWorkerRef.current) {
-        cameraWorkerRef.current.postMessage({ action: 'stop' });
+      if (captureIntervalRef.current) {
+        clearInterval(captureIntervalRef.current);
+        captureIntervalRef.current = null;
       }
       if (localStream) {
         localStream.getTracks().forEach(track => track.stop());
@@ -283,8 +267,9 @@ export default function App() {
 
     return () => {
       // Don't kill tracks on tab change unmount, wait for explicit deactivate
-      if (cameraWorkerRef.current) {
-        cameraWorkerRef.current.postMessage({ action: 'stop' });
+      if (captureIntervalRef.current) {
+        clearInterval(captureIntervalRef.current);
+        captureIntervalRef.current = null;
       }
       // If we are unmounting completely we can stop the track, but useEffect re-runs shouldn't kill it unless we want to
       // Wait, to keep track stable we ONLY stop the track on explicit isWebcamActive change which is handled by the else block.
@@ -293,12 +278,10 @@ export default function App() {
 
   // Demo Camera Generator Loop (for easier offline twitch layout testing)
   useEffect(() => {
+    let mockInterval: NodeJS.Timeout | null = null;
+    
     if (mockCameraEnabled && currentPlayerSlotId) {
-      if (!mockWorkerRef.current) {
-        mockWorkerRef.current = new Worker(URL.createObjectURL(hardWorkerBlob));
-      }
-
-      mockWorkerRef.current.onmessage = () => {
+      mockInterval = setInterval(() => {
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
           // Generate a thematic canvas graphics frame with randomized visual values & noise
           const canvas = document.createElement('canvas');
@@ -364,19 +347,17 @@ export default function App() {
             }));
           }
         }
-      };
-      
-      mockWorkerRef.current.postMessage({ action: 'start', ms: 300 });
+      }, 300);
     } else {
-       if (mockWorkerRef.current) {
-         mockWorkerRef.current.postMessage({ action: 'stop' });
+       if (mockInterval) {
+         clearInterval(mockInterval);
        }
     }
 
     return () => {
       // Don't kill worker on unmount unless needed, though unmount does clean it up.
-      if (mockWorkerRef.current) {
-        mockWorkerRef.current.postMessage({ action: 'stop' });
+      if (mockInterval) {
+        clearInterval(mockInterval);
       }
     };
   }, [mockCameraEnabled, currentPlayerSlotId, activeTab]);
