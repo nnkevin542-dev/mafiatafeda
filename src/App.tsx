@@ -28,8 +28,22 @@ import {
 } from './audio';
 
 // Constants
-const WEBCAM_FPS = 10; // Smooth 10 FPS for network transmission (local video will be full FPS)
+const WEBCAM_FPS = 8; // Stable, smooth FPS that won't overload websockets
 const WS_RECONNECT_INTERVAL = 3000;
+
+// Inline worker to force background timer execution without browser throttling (1000ms clamp)
+const hardWorkerBlob = new Blob([`
+  let timerId = null;
+  self.onmessage = function(e) {
+    if (e.data.action === 'start') {
+      if (timerId) clearInterval(timerId);
+      timerId = setInterval(() => self.postMessage('tick'), e.data.ms);
+    } else if (e.data.action === 'stop') {
+      clearInterval(timerId);
+      timerId = null;
+    }
+  }
+`], { type: 'application/javascript' });
 
 export default function App() {
   // Navigation tabs: 'overlay' | 'host' | 'player'
@@ -71,6 +85,8 @@ export default function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const cameraWorkerRef = useRef<Worker | null>(null);
+  const mockWorkerRef = useRef<Worker | null>(null);
   const captureIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const webcamFramesRef = useRef<Record<number, string>>({});
 
@@ -189,9 +205,14 @@ export default function App() {
     }
   }, [gameState.victory, soundEnabled, volume]);
 
+  // Hidden elements for continuous global webcam capture
+  const globalVideoRef = useRef<HTMLVideoElement>(document.createElement('video'));
+  const globalCanvasRef = useRef<HTMLCanvasElement>(document.createElement('canvas'));
+
   // 2. Local Desktop Webcame capture handler
   useEffect(() => {
-    if (isWebcamActive && activeTab === 'player' && currentPlayerSlotId) {
+    // Run if webcam is active, regardless of activeTab so the stream doesn't die when switching tabs
+    if (isWebcamActive && currentPlayerSlotId) {
       // Initalize camera using ideal standard 16:9 HD resolution for local fluid preview
       navigator.mediaDevices.getUserMedia({ 
         video: { 
@@ -202,28 +223,35 @@ export default function App() {
       })
       .then((stream) => {
         setLocalStream(stream);
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          videoRef.current.onloadedmetadata = () => {
-            videoRef.current?.play().catch(e => console.warn('Video play failed:', e));
-          };
+
+        // Bind stream to our global persistent video reference
+        const vid = globalVideoRef.current;
+        vid.autoplay = true;
+        vid.playsInline = true;
+        vid.muted = true;
+        vid.srcObject = stream;
+        vid.onloadedmetadata = () => {
+          vid.play().catch(e => console.warn('Global video play failed:', e));
+        };
+
+        // Setup ticked canvas snapshot using background web-worker
+        if (!cameraWorkerRef.current) {
+          cameraWorkerRef.current = new Worker(URL.createObjectURL(hardWorkerBlob));
         }
 
-        // Setup ticking canvas snapshot capturing to base64
-        captureIntervalRef.current = setInterval(() => {
-          // Pause camera capture stream when tab is hidden or minimized to save huge device resources and prevent lags
-          if (document.visibilityState !== 'visible') return;
-
-          if (videoRef.current && canvasRef.current && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-            const context = canvasRef.current.getContext('2d');
+        cameraWorkerRef.current.onmessage = () => {
+          // Do not pause on visibilityState so OBS/Twitch captures continue without lag when streamer minimizes
+          if (vid && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            const canvas = globalCanvasRef.current;
+            const context = canvas.getContext('2d');
             if (context) {
               // Ensure size is exactly 16:9 (480x270) to look absolutely perfect, crisp and natural
-              canvasRef.current.width = 480;
-              canvasRef.current.height = 270;
-              context.drawImage(videoRef.current, 0, 0, 480, 270);
+              canvas.width = 480;
+              canvas.height = 270;
+              context.drawImage(vid, 0, 0, 480, 270);
               
               // Compress to jpeg with higher quality since we raised constraints
-              const jpegDataUrl = canvasRef.current.toDataURL('image/jpeg', 0.4);
+              const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.4);
               
               // Send off
               wsRef.current.send(JSON.stringify({
@@ -233,18 +261,19 @@ export default function App() {
               }));
             }
           }
-        }, 1000 / WEBCAM_FPS);
+        };
+
+        cameraWorkerRef.current.postMessage({ action: 'start', ms: 1000 / WEBCAM_FPS });
       })
       .catch((err) => {
         console.error('Error starting camera stream:', err);
-        alert('Не удалось получить доступ к веб-камере. Пожалуйста, предоставьте разрешения в браузене или переключитесь на "Демо-Камеру".');
+        alert('Не удалось получить доступ к веб-камере. Пожалуйста, предоставьте разрешения в браусере или переключитесь на "Демо-Камеру".');
         setIsWebcamActive(false);
       });
     } else {
-      // Clean up camera slots
-      if (captureIntervalRef.current) {
-        clearInterval(captureIntervalRef.current);
-        captureIntervalRef.current = null;
+      // Clean up camera slots when explicitly turned off
+      if (cameraWorkerRef.current) {
+        cameraWorkerRef.current.postMessage({ action: 'stop' });
       }
       if (localStream) {
         localStream.getTracks().forEach(track => track.stop());
@@ -253,19 +282,23 @@ export default function App() {
     }
 
     return () => {
-      if (captureIntervalRef.current) clearInterval(captureIntervalRef.current);
-      if (localStream) {
-        localStream.getTracks().forEach(track => track.stop());
+      // Don't kill tracks on tab change unmount, wait for explicit deactivate
+      if (cameraWorkerRef.current) {
+        cameraWorkerRef.current.postMessage({ action: 'stop' });
       }
+      // If we are unmounting completely we can stop the track, but useEffect re-runs shouldn't kill it unless we want to
+      // Wait, to keep track stable we ONLY stop the track on explicit isWebcamActive change which is handled by the else block.
     };
-  }, [isWebcamActive, currentPlayerSlotId, activeTab]);
+  }, [isWebcamActive, currentPlayerSlotId]);
 
   // Demo Camera Generator Loop (for easier offline twitch layout testing)
   useEffect(() => {
-    let mockInterval: NodeJS.Timeout | null = null;
-    
-    if (mockCameraEnabled && activeTab === 'player' && currentPlayerSlotId) {
-      mockInterval = setInterval(() => {
+    if (mockCameraEnabled && currentPlayerSlotId) {
+      if (!mockWorkerRef.current) {
+        mockWorkerRef.current = new Worker(URL.createObjectURL(hardWorkerBlob));
+      }
+
+      mockWorkerRef.current.onmessage = () => {
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
           // Generate a thematic canvas graphics frame with randomized visual values & noise
           const canvas = document.createElement('canvas');
@@ -331,11 +364,20 @@ export default function App() {
             }));
           }
         }
-      }, 300);
+      };
+      
+      mockWorkerRef.current.postMessage({ action: 'start', ms: 300 });
+    } else {
+       if (mockWorkerRef.current) {
+         mockWorkerRef.current.postMessage({ action: 'stop' });
+       }
     }
 
     return () => {
-      if (mockInterval) clearInterval(mockInterval);
+      // Don't kill worker on unmount unless needed, though unmount does clean it up.
+      if (mockWorkerRef.current) {
+        mockWorkerRef.current.postMessage({ action: 'stop' });
+      }
     };
   }, [mockCameraEnabled, currentPlayerSlotId, activeTab]);
 
@@ -603,7 +645,7 @@ export default function App() {
                     }`}
                   >
                     {/* Camera snapshot/live rendering container */}
-                    <div className="absolute inset-0 w-full h-full bg-stone-950/95 flex items-center justify-center overflow-hidden feed-scanlines">
+                    <div className="absolute inset-0 w-full h-full bg-stone-950/95 flex items-center justify-center overflow-hidden">
                       {player.alive ? (
                         <>
                           {/* Live 16:9 camera feed, direct-DOM optimized to prevent lag/rendering dropouts */}
@@ -698,7 +740,7 @@ export default function App() {
                     id="overlay-host-card"
                     className="relative aspect-video rounded-xl overflow-hidden bg-leather-card border-gold border rounded-xl col-span-2 sm:col-span-1 shadow-2xl flex flex-col justify-end"
                   >
-                    <div className="absolute inset-0 w-full h-full bg-stone-950/95 flex items-center justify-center overflow-hidden feed-scanlines">
+                    <div className="absolute inset-0 w-full h-full bg-stone-950/95 flex items-center justify-center overflow-hidden">
                       {/* Live 16:9 Host Webcam Feed, direct-DOM optimized */}
                       <img 
                         id="cam-feed-12"
@@ -875,7 +917,12 @@ export default function App() {
                   {/* Local Video Stream Preview */}
                   <div className="relative aspect-video rounded-xl overflow-hidden bg-stone-950 border border-stone-800 flex items-center justify-center" id="monitor-box">
                     <video 
-                      ref={videoRef} 
+                      ref={(el) => {
+                        if (el && localStream && el.srcObject !== localStream) {
+                          el.srcObject = localStream;
+                        }
+                      }} 
+                      autoPlay
                       className={`w-full h-full object-cover transform scale-x-[-1] ${isWebcamActive && !mockCameraEnabled ? 'block' : 'hidden'}`}
                       muted 
                       playsInline
